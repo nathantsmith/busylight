@@ -2,7 +2,11 @@
 
 Busylights is a small macOS menu bar app that turns Govee LAN lights into an automatic meeting status light. When your Mac reports that the microphone or camera is active, enabled lights switch to your busy color; when recording stops, they switch back to your available color.
 
-![Busylights app icon](assets/app_icon.png)
+<p align="center">
+  <img src="assets/readme_dual_mic_icon_small.png" alt="Busylights red and green microphone icon" width="96" height="96">
+</p>
+
+The menu bar icon stays out of the way until your meeting status changes. The light does the visible signaling: red for busy, green for available, or any colors you choose.
 
 ## Features
 
@@ -70,6 +74,12 @@ After launching `Busylights.app`, look for the microphone icon in the macOS menu
 - `Off`: turns enabled lights off.
 - `Settings`: choose colors and brightness levels.
 - `Open GUI`: opens the settings window for scanning devices and editing enabled lights.
+
+## Example
+
+Place a Govee lamp or strip where it is visible in your workspace. Busylights can split the room visually: a red busy glow while your mic or camera is active, then a green available glow when the call ends.
+
+![Example workspace with a diagonal split between red busy light and green available light](assets/readme_busy_light_example.png)
 
 ## Configuration
 
