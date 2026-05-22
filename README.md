@@ -79,7 +79,7 @@ After launching `Busylights.app`, look for the microphone icon in the macOS menu
 
 Place a Govee lamp or strip where it is visible in your workspace. Busylights can split the room visually: a red busy glow while your mic or camera is active, then a green available glow when the call ends.
 
-![Example workspace with a diagonal split between red busy light and green available light](assets/readme_busy_light_example.png)
+![Busylights menu bar dropdown over a red and green workspace wallpaper](assets/readme_menu_overlay_example.png)
 
 ## Configuration
 
