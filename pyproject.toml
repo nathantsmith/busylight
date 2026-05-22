@@ -1,0 +1,31 @@
+[project]
+name = "busylight"
+version = "0.1.0"
+description = "macOS menu bar busy light controller for Govee LAN lights"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "govee-local-api>=1.5.3",
+    "inquirer>=3.0.0",
+    "pillow>=12.1.0",
+    "rumps>=0.4.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0",
+]
+
+[project.scripts]
+busylight = "main:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Only these top-level .py modules (excludes BusylightsApp, assets, etc.)
+py-modules = ["main", "busylights", "busylights_menubar", "busylights_gui", "mic_status"]
+
+[tool.uv]
+package = true

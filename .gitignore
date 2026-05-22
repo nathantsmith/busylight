@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.spec
+*.log
+*.zip
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS metadata
+.DS_Store
+
+# Local Busylights config if copied into the repo while debugging
+config.json
+device
