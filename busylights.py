@@ -12,7 +12,9 @@ import argparse
 import asyncio
 import json
 import signal
+import socket
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +26,10 @@ from mic_status import is_recording
 CHECK_INTERVAL = 3  # seconds between status checks
 # Delay between UDP commands so the device processes each one (avoids dropped "available" color)
 COMMAND_DELAY = 0.25
+# If the loop pauses longer than this, assume macOS slept and rebuild sockets/devices.
+WAKE_RECOVERY_GAP_SECONDS = 15
+# Re-discover after wake/network changes so DHCP/IP changes are picked up automatically.
+RECOVERY_DISCOVERY_PROBE_COUNT = 3
 
 # Color options for active (busy) / inactive (available) dropdowns: (display_name, rgb_tuple)
 COLOR_OPTIONS: list[tuple[str, tuple[int, int, int]]] = [
@@ -131,6 +137,81 @@ def _is_ip(s: str) -> bool:
     return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
+def _enabled_device_entries(config: dict) -> list[dict]:
+    return [
+        e
+        for e in (config.get("devices") or [])
+        if isinstance(e, dict) and e.get("ip") and e.get("sku") and e.get("fingerprint") and e.get("enabled", True)
+    ]
+
+
+def _network_signature() -> str | None:
+    """Return the current outbound IPv4 address, or None when no route is available."""
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+async def _create_controller(device_entries: list[dict]) -> tuple[GoveeController, list[GoveeDevice]]:
+    controller = GoveeController(
+        discovery_enabled=False,
+        update_enabled=False,
+    )
+    await controller.start()
+
+    for entry in device_entries:
+        controller.add_device(entry["ip"], entry["sku"], entry["fingerprint"], None)
+    return controller, controller.devices
+
+
+async def _refresh_config_from_discovery(config: dict) -> dict:
+    try:
+        discovered = await discover_devices(probe_count=RECOVERY_DISCOVERY_PROBE_COUNT)
+    except Exception as exc:
+        print(f"Recovery discovery failed: {exc}")
+        return config
+    if not discovered:
+        return config
+
+    config["devices"] = merge_discovered_into_config(config, discovered)
+    save_full_config(config)
+    return load_full_config()
+
+
+async def _recover_controller(
+    controller: GoveeController,
+    reason: str,
+) -> tuple[dict, GoveeController, list[GoveeDevice]]:
+    print(f"Recovering Govee connection after {reason}...")
+    try:
+        controller.cleanup()
+    except Exception:
+        pass
+
+    config = await _refresh_config_from_discovery(load_full_config())
+    valid_entries = _enabled_device_entries(config)
+    if not valid_entries:
+        print("No enabled devices available after recovery.")
+        controller, selected_devices = await _create_controller([])
+        return config, controller, selected_devices
+
+    controller, selected_devices = await _create_controller(valid_entries)
+    print(f"Recovered {len(selected_devices)} device(s): {_format_devices(selected_devices)}")
+    return config, controller, selected_devices
+
+
+def _format_devices(devices: list[GoveeDevice]) -> str:
+    return ", ".join(f"{d.sku}@{d.ip}" for d in devices) or "(none)"
+
+
 async def discover_devices(probe_count: int | None = None) -> list[GoveeDevice]:
     """Discover Govee devices and return the list (controller is cleaned up).
     probe_count: number of probes (default DISCOVERY_PROBE_COUNT). Only used for --discover / --config.
@@ -142,22 +223,24 @@ async def discover_devices(probe_count: int | None = None) -> list[GoveeDevice]:
         update_enabled=False,
     )
     await controller.start()
-    print(f"Discovering Govee devices ({n} probe{'s' if n != 1 else ''}, every {DISCOVERY_POLL_INTERVAL}s)...")
-    probe = 0
-    while probe < n:
-        controller.send_discovery_message()
-        probe += 1
-        await asyncio.sleep(DISCOVERY_POLL_INTERVAL)
+    try:
+        print(f"Discovering Govee devices ({n} probe{'s' if n != 1 else ''}, every {DISCOVERY_POLL_INTERVAL}s)...")
+        probe = 0
+        while probe < n:
+            controller.send_discovery_message()
+            probe += 1
+            await asyncio.sleep(DISCOVERY_POLL_INTERVAL)
+            devices = controller.devices
+            print(f"  probe {probe}/{n}: {len(devices)} device(s) — {[f'{d.sku}@{d.ip}' for d in devices]}")
+        # Let late UDP responses arrive before reading final list
+        if DISCOVERY_SETTLE_SECONDS > 0:
+            await asyncio.sleep(DISCOVERY_SETTLE_SECONDS)
+            devices = controller.devices
+            print(f"  (after {DISCOVERY_SETTLE_SECONDS}s settle: {len(devices)} device(s))")
         devices = controller.devices
-        print(f"  probe {probe}/{n}: {len(devices)} device(s) — {[f'{d.sku}@{d.ip}' for d in devices]}")
-    # Let late UDP responses arrive before reading final list
-    if DISCOVERY_SETTLE_SECONDS > 0:
-        await asyncio.sleep(DISCOVERY_SETTLE_SECONDS)
-        devices = controller.devices
-        print(f"  (after {DISCOVERY_SETTLE_SECONDS}s settle: {len(devices)} device(s))")
-    devices = controller.devices
-    controller.cleanup()
-    return devices
+        return devices
+    finally:
+        controller.cleanup()
 
 
 async def run_discover() -> None:
@@ -274,6 +357,22 @@ async def _apply_color_to_device(
     await controller.set_color(device, rgb=rgb, temperature=None)
 
 
+async def _apply_color_to_devices(
+    controller: GoveeController,
+    devices: list[GoveeDevice],
+    rgb: tuple[int, int, int],
+    brightness: int,
+) -> bool:
+    ok = True
+    for device in devices:
+        try:
+            await _apply_color_to_device(controller, device, rgb, brightness)
+        except Exception as exc:
+            ok = False
+            print(f"  Failed to update {device.sku}@{device.ip}: {exc}")
+    return ok
+
+
 async def run_loop(
     on_status_change: Callable[[bool], None] | None = None,
     get_mode_rgb: (
@@ -294,31 +393,19 @@ async def run_loop(
 ) -> bool:
     """Returns False if no devices. get_mode_rgb returns (mode, manual_rgb, active_rgb, inactive_rgb, active_brightness, inactive_brightness, manual_brightness)."""
     config = load_full_config()
-    device_entries = config.get("devices") or []
-    valid_entries = [
-        e for e in device_entries
-        if isinstance(e, dict) and e.get("ip") and e.get("sku") and e.get("fingerprint") and e.get("enabled", True)
-    ]
+    valid_entries = _enabled_device_entries(config)
     if not valid_entries:
         print("No devices enabled. Run --discover to scan, then --config to enable device(s) and set colors.")
         return False
 
-    controller = GoveeController(
-        discovery_enabled=False,
-        update_enabled=False,
-    )
-    await controller.start()
-
-    for entry in valid_entries:
-        controller.add_device(entry["ip"], entry["sku"], entry["fingerprint"], None)
-    selected_devices = controller.devices
+    controller, selected_devices = await _create_controller(valid_entries)
     active_rgb = COLOR_NAME_TO_RGB.get(config["active_color"], (255, 0, 0))
     inactive_rgb = COLOR_NAME_TO_RGB.get(config["inactive_color"], (0, 255, 0))
     active_brightness = max(0, min(100, config.get("active_brightness", 50)))
     inactive_brightness = max(0, min(100, config.get("inactive_brightness", 50)))
     manual_brightness = max(0, min(100, config.get("manual_brightness", 50)))
 
-    print(f"Using {len(selected_devices)} device(s): {', '.join(f'{d.sku}@{d.ip}' for d in selected_devices)}")
+    print(f"Using {len(selected_devices)} device(s): {_format_devices(selected_devices)}")
     print(f"Colors: busy={config['active_color']}, available={config['inactive_color']}")
     if get_mode_rgb:
         print("Mode: driven by menu bar (Auto/Manual)")
@@ -351,7 +438,7 @@ async def run_loop(
     print(f"Initializing {len(selected_devices)} device(s)...")
     for device in selected_devices:
         print(f"  Setting up {device.sku}@{device.ip}...")
-        await _apply_color_to_device(controller, device, initial_rgb, initial_brightness)
+    if await _apply_color_to_devices(controller, selected_devices, initial_rgb, initial_brightness):
         print(f"    ✓ Set to {initial_status} (RGB: {initial_rgb}, brightness: {initial_brightness})")
 
     last_busy: bool | None = is_recording() if not get_mode_rgb else None
@@ -360,21 +447,53 @@ async def run_loop(
     if get_mode_rgb and last_busy is None:
         last_busy = is_recording()
 
+    last_tick = time.time()
+    last_network = _network_signature()
+    current_rgb = initial_rgb
+    current_brightness = initial_brightness
+
+    async def recover_if_needed() -> bool:
+        nonlocal config, controller, selected_devices, last_network, last_tick
+        now = time.time()
+        current_network = _network_signature()
+        reason: str | None = None
+        if now - last_tick > WAKE_RECOVERY_GAP_SECONDS:
+            reason = f"wake/sleep gap ({now - last_tick:.0f}s)"
+        elif current_network != last_network:
+            reason = f"network change ({last_network or 'none'} -> {current_network or 'none'})"
+
+        last_tick = now
+        last_network = current_network
+        if reason is None:
+            return False
+
+        config, controller, selected_devices = await _recover_controller(controller, reason)
+        if selected_devices:
+            await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
+        return True
+
     try:
         while True:
+            await recover_if_needed()
             if get_mode_rgb:
                 mode, m_rgb, a_rgb, inactive_rgb, a_br, i_br, m_br = get_mode_rgb()
                 active_rgb = a_rgb
                 a_br, i_br, m_br = max(0, min(100, a_br)), max(0, min(100, i_br)), max(0, min(100, m_br))
                 if mode == "off":
-                    for device in selected_devices:
-                        await _apply_color_to_device(controller, device, inactive_rgb, 0)
+                    current_rgb, current_brightness = inactive_rgb, 0
+                    ok = await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
+                    if not ok:
+                        config, controller, selected_devices = await _recover_controller(controller, "send failure")
+                        await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
                     await asyncio.sleep(1.0)
                     continue
                 if mode == "manual" and m_rgb is not None:
                     rgb, br = m_rgb, m_br
-                    for device in selected_devices:
-                        await _apply_color_to_device(controller, device, rgb, br)
+                    current_rgb, current_brightness = rgb, br
+                    ok = await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
+                    if not ok:
+                        config, controller, selected_devices = await _recover_controller(controller, "send failure")
+                        await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
                     await asyncio.sleep(1.0)
                     continue
                 busy = is_recording()
@@ -382,8 +501,11 @@ async def run_loop(
                     on_status_change(busy)
                 rgb = active_rgb if busy else inactive_rgb
                 br = a_br if busy else i_br
-                for device in selected_devices:
-                    await _apply_color_to_device(controller, device, rgb, br)
+                current_rgb, current_brightness = rgb, br
+                ok = await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
+                if not ok:
+                    config, controller, selected_devices = await _recover_controller(controller, "send failure")
+                    await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
             busy = is_recording()
@@ -392,10 +514,14 @@ async def run_loop(
             if busy != last_busy:
                 rgb = active_rgb if busy else inactive_rgb
                 br = active_brightness if busy else inactive_brightness
+                current_rgb, current_brightness = rgb, br
                 status = f"busy ({config['active_color']})" if busy else f"available ({config['inactive_color']})"
                 print(f"Status changed to: {status} (RGB: {rgb}, brightness: {br})")
+                ok = await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
+                if not ok:
+                    config, controller, selected_devices = await _recover_controller(controller, "send failure")
+                    await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
                 for device in selected_devices:
-                    await _apply_color_to_device(controller, device, rgb, br)
                     print(f"  → Updated {device.sku}@{device.ip}")
                 print(status)
                 last_busy = busy
