@@ -6,12 +6,14 @@ Uses same config as CLI/GUI. Icons for Auto, Manual, Settings.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import rumps
@@ -116,10 +118,16 @@ def _refresh_state_from_config_if_changed() -> None:
 
 
 def _run_loop_thread() -> None:
+    log_path = CONFIG_JSON.with_name("busylights.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        asyncio.run(run_loop(on_status_change=_set_status, get_mode_rgb=_get_mode_rgb))
+        with log_path.open("a", buffering=1) as log:
+            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                print(f"\n[{datetime.now().isoformat(timespec='seconds')}] starting light loop")
+                asyncio.run(run_loop(on_status_change=_set_status, get_mode_rgb=_get_mode_rgb))
     except Exception:
-        traceback.print_exc()
+        with log_path.open("a", buffering=1) as log:
+            traceback.print_exc(file=log)
 
 
 class BusylightsMenuBarApp(rumps.App):

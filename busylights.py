@@ -32,7 +32,7 @@ WAKE_RECOVERY_GAP_SECONDS = 15
 RECOVERY_DISCOVERY_PROBE_COUNT = 3
 # UDP sends can succeed even when a light has moved to a new IP, so refresh LAN
 # discovery periodically while the menu bar app is running.
-PERIODIC_REDISCOVERY_SECONDS = 120
+PERIODIC_REDISCOVERY_SECONDS = 60
 
 # Color options for active (busy) / inactive (available) dropdowns: (display_name, rgb_tuple)
 COLOR_OPTIONS: list[tuple[str, tuple[int, int, int]]] = [
@@ -163,16 +163,39 @@ def _network_signature() -> str | None:
             sock.close()
 
 
-async def _create_controller(device_entries: list[dict]) -> tuple[GoveeController, list[GoveeDevice]]:
+async def _create_controller(
+    device_entries: list[dict],
+    *,
+    listening_port: int | None = None,
+) -> tuple[GoveeController, list[GoveeDevice]]:
+    kwargs = {}
+    if listening_port is not None:
+        kwargs["listening_port"] = listening_port
     controller = GoveeController(
         discovery_enabled=False,
         update_enabled=False,
+        **kwargs,
     )
+    controller._busylight_udp_errors = []  # type: ignore[attr-defined]
+    if not hasattr(controller, "error_received"):
+        def _record_udp_error(exc: Exception) -> None:
+            controller._busylight_udp_errors.append(exc)  # type: ignore[attr-defined]
+            print(f"Govee UDP error: {exc}")
+
+        controller.error_received = _record_udp_error  # type: ignore[attr-defined]
     await controller.start()
 
     for entry in device_entries:
         controller.add_device(entry["ip"], entry["sku"], entry["fingerprint"], None)
     return controller, controller.devices
+
+
+async def _cleanup_controller(controller: GoveeController) -> None:
+    try:
+        done = controller.cleanup()
+        await asyncio.wait_for(done.wait(), timeout=1.0)
+    except Exception:
+        pass
 
 
 async def _refresh_config_from_discovery(config: dict) -> dict:
@@ -194,10 +217,7 @@ async def _recover_controller(
     reason: str,
 ) -> tuple[dict, GoveeController, list[GoveeDevice]]:
     print(f"Recovering Govee connection after {reason}...")
-    try:
-        controller.cleanup()
-    except Exception:
-        pass
+    await _cleanup_controller(controller)
 
     config = await _refresh_config_from_discovery(load_full_config())
     valid_entries = _enabled_device_entries(config)
@@ -213,6 +233,18 @@ async def _recover_controller(
 
 def _format_devices(devices: list[GoveeDevice]) -> str:
     return ", ".join(f"{d.sku}@{d.ip}" for d in devices) or "(none)"
+
+
+def _entries_from_devices(devices: list[GoveeDevice]) -> list[dict]:
+    return [
+        {
+            "fingerprint": device.fingerprint,
+            "ip": device.ip,
+            "sku": device.sku,
+            "enabled": True,
+        }
+        for device in devices
+    ]
 
 
 async def discover_devices(probe_count: int | None = None) -> list[GoveeDevice]:
@@ -243,7 +275,7 @@ async def discover_devices(probe_count: int | None = None) -> list[GoveeDevice]:
         devices = controller.devices
         return devices
     finally:
-        controller.cleanup()
+        await _cleanup_controller(controller)
 
 
 async def run_discover() -> None:
@@ -366,14 +398,28 @@ async def _apply_color_to_devices(
     rgb: tuple[int, int, int],
     brightness: int,
 ) -> bool:
+    del controller  # Command sends use a fresh UDP transport so sleep cannot stale it.
+    if not devices:
+        return True
+
+    command_controller, command_devices = await _create_controller(
+        _entries_from_devices(devices),
+        listening_port=0,
+    )
     ok = True
-    for device in devices:
-        try:
-            await _apply_color_to_device(controller, device, rgb, brightness)
-        except Exception as exc:
+    try:
+        for device in command_devices:
+            try:
+                await _apply_color_to_device(command_controller, device, rgb, brightness)
+            except Exception as exc:
+                ok = False
+                print(f"  Failed to update {device.sku}@{device.ip}: {exc}")
+        await asyncio.sleep(0.5)
+        if command_controller._busylight_udp_errors:  # type: ignore[attr-defined]
             ok = False
-            print(f"  Failed to update {device.sku}@{device.ip}: {exc}")
-    return ok
+        return ok
+    finally:
+        await _cleanup_controller(command_controller)
 
 
 async def run_loop(
@@ -441,7 +487,11 @@ async def run_loop(
     print(f"Initializing {len(selected_devices)} device(s)...")
     for device in selected_devices:
         print(f"  Setting up {device.sku}@{device.ip}...")
-    if await _apply_color_to_devices(controller, selected_devices, initial_rgb, initial_brightness):
+    initial_ok = await _apply_color_to_devices(controller, selected_devices, initial_rgb, initial_brightness)
+    if not initial_ok:
+        config, controller, selected_devices = await _recover_controller(controller, "initial send failure")
+        initial_ok = await _apply_color_to_devices(controller, selected_devices, initial_rgb, initial_brightness)
+    if initial_ok:
         print(f"    ✓ Set to {initial_status} (RGB: {initial_rgb}, brightness: {initial_brightness})")
 
     last_busy: bool | None = is_recording() if not get_mode_rgb else None
@@ -536,7 +586,7 @@ async def run_loop(
     except asyncio.CancelledError:
         pass
     finally:
-        controller.cleanup()
+        await _cleanup_controller(controller)
         print("\nStopped.")
     return True
 
