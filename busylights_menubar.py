@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 import threading
+import time
+import traceback
 from pathlib import Path
 
 import rumps
@@ -56,6 +58,7 @@ _inactive_brightness = 50
 _manual_brightness = 50
 _current_busy: bool | None = None
 _last_config_mtime: float | None = None
+_last_loop_start = 0.0
 
 BRIGHTNESS_OPTIONS = (0, 25, 50, 75, 100)  # 0% = off
 
@@ -116,7 +119,7 @@ def _run_loop_thread() -> None:
     try:
         asyncio.run(run_loop(on_status_change=_set_status, get_mode_rgb=_get_mode_rgb))
     except Exception:
-        pass
+        traceback.print_exc()
 
 
 class BusylightsMenuBarApp(rumps.App):
@@ -286,8 +289,14 @@ class BusylightsMenuBarApp(rumps.App):
         rumps.quit_application()
 
     def _update_title_and_menu(self, _: object) -> None:
+        global _last_loop_start
         _refresh_state_from_config_if_changed()
         self._refresh_checkmarks()
+        now = time.monotonic()
+        if (self._thread is None or not self._thread.is_alive()) and now - _last_loop_start > 30:
+            _last_loop_start = now
+            self._thread = threading.Thread(target=_run_loop_thread, daemon=True)
+            self._thread.start()
         with _state_lock:
             mode = _mode
             busy = _current_busy
@@ -295,7 +304,9 @@ class BusylightsMenuBarApp(rumps.App):
         self.title = ""
 
     def run(self, *args: object, **kwargs: object) -> None:
+        global _last_loop_start
         self._refresh_checkmarks()
+        _last_loop_start = time.monotonic()
         self._thread = threading.Thread(target=_run_loop_thread, daemon=True)
         self._thread.start()
         rumps.Timer(self._update_title_and_menu, interval=1.0).start()

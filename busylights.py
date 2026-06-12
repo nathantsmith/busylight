@@ -30,6 +30,9 @@ COMMAND_DELAY = 0.25
 WAKE_RECOVERY_GAP_SECONDS = 15
 # Re-discover after wake/network changes so DHCP/IP changes are picked up automatically.
 RECOVERY_DISCOVERY_PROBE_COUNT = 3
+# UDP sends can succeed even when a light has moved to a new IP, so refresh LAN
+# discovery periodically while the menu bar app is running.
+PERIODIC_REDISCOVERY_SECONDS = 120
 
 # Color options for active (busy) / inactive (available) dropdowns: (display_name, rgb_tuple)
 COLOR_OPTIONS: list[tuple[str, tuple[int, int, int]]] = [
@@ -449,11 +452,12 @@ async def run_loop(
 
     last_tick = time.time()
     last_network = _network_signature()
+    last_discovery_refresh = last_tick
     current_rgb = initial_rgb
     current_brightness = initial_brightness
 
     async def recover_if_needed() -> bool:
-        nonlocal config, controller, selected_devices, last_network, last_tick
+        nonlocal config, controller, selected_devices, last_network, last_tick, last_discovery_refresh
         now = time.time()
         current_network = _network_signature()
         reason: str | None = None
@@ -461,6 +465,8 @@ async def run_loop(
             reason = f"wake/sleep gap ({now - last_tick:.0f}s)"
         elif current_network != last_network:
             reason = f"network change ({last_network or 'none'} -> {current_network or 'none'})"
+        elif now - last_discovery_refresh > PERIODIC_REDISCOVERY_SECONDS:
+            reason = "periodic LAN rediscovery"
 
         last_tick = now
         last_network = current_network
@@ -468,6 +474,7 @@ async def run_loop(
             return False
 
         config, controller, selected_devices = await _recover_controller(controller, reason)
+        last_discovery_refresh = time.time()
         if selected_devices:
             await _apply_color_to_devices(controller, selected_devices, current_rgb, current_brightness)
         return True
